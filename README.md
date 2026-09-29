@@ -1,114 +1,181 @@
-# Delinea Secret Server credential driver for NVIDIA OpenShell
+<div align="center">
 
-An [OpenShell](https://github.com/NVIDIA/OpenShell) **credential driver** that stores and resolves
-the gateway's provider credentials (API keys, tokens) in **Delinea Secret Server**, including the
-Secret Server vault behind a **Delinea Platform** tenant, instead of the gateway's built-in
-encrypted database store.
+# 🔐 openshell-secret-server-driver
 
-OpenShell supports external credential drivers over a local gRPC socket (`transport = "uds"`), so
-this runs next to an unmodified OpenShell gateway. It implements
-`openshell.credentials.v1.CredentialDriver` (see `proto/`).
+**Your agents' credentials live in Delinea Secret Server.<br/>OpenShell hands them out only where policy says so.**
 
-**Status:** proof of concept. Live-verified against a Delinea Platform tenant (14/14 live checks)
-and 31/31 checks against a mock Secret Server.
+A credential driver that plugs [Delinea Secret Server](https://delinea.com/products/secret-server)
+(and the vault behind a [Delinea Platform](https://delinea.com/products) tenant) into
+[NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell), the open-source runtime for sandboxed AI agents.
+
+![status](https://img.shields.io/badge/status-proof%20of%20concept-orange)
+![OpenShell](https://img.shields.io/badge/OpenShell-credential%20driver-76b900)
+![protocol](https://img.shields.io/badge/driver%20protocol-v1.0-blue)
+![mock suite](https://img.shields.io/badge/mock%20suite-31%2F31-brightgreen)
+![live](https://img.shields.io/badge/Delinea%20Platform%20live%20tests-14%2F14-brightgreen)
+![python](https://img.shields.io/badge/python-3.9%2B-3776ab)
+
+</div>
+
+> [!NOTE]
+> Built at **[Delinea](https://delinea.com)**. Released as an **unofficial, Delinea-sponsored**
+> project. It isn't an official Delinea product and isn't covered by Delinea support.
+> Not affiliated with or endorsed by NVIDIA.
+
+---
+
+## Why
+
+OpenShell already keeps real secrets out of the agent: the sandbox sees a placeholder, and the
+supervisor swaps in the real value only on requests to endpoints the policy approves. This driver
+decides **where those secrets live**:
+
+- 🏦 **One vault.** Agent credentials sit in Secret Server next to everything else you already govern.
+- 🔎 **Every read is audited.** Each time the gateway resolves a credential, it shows up in the secret's audit trail.
+- 🔄 **Rotation just works.** Rotate in Secret Server; the next resolve returns the new value with no OpenShell change.
+- 🚫 **No secrets on disk.** The gateway keeps only opaque handles.
 
 ## How it works
 
-```
-OpenShell gateway ──gRPC over Unix socket──> this driver ──HTTPS REST──> Secret Server
-  (provider records keep only handles)         (no secrets on disk)       (vault, audit, rotation)
+```mermaid
+flowchart LR
+    subgraph Sandbox["OpenShell sandbox"]
+        A["🤖 Agent<br/>sees placeholders only"]
+    end
+    S["Supervisor<br/>injects real values at approved endpoints"]
+    G["OpenShell gateway<br/>stores handles, not secrets"]
+    D["🔐 this driver"]
+    V[("Delinea Secret Server<br/>or Platform vault")]
+    API[("Approved APIs")]
+
+    A -- "request with placeholder" --> S
+    S -- "real credential" --> API
+    G -- "gRPC over Unix socket" --> D
+    D -- "HTTPS REST" --> V
+    G -. "provider environment" .-> S
 ```
 
-| OpenShell call | What the driver does in Secret Server |
+| OpenShell call | What happens in Secret Server |
 |---|---|
-| `GetCapabilities` | Protocol negotiation (major version 1, `openshell.credentials.contract`). |
-| `StoreCredential` | Creates one secret per credential in a dedicated folder, or updates its field when the gateway passes an existing handle. |
-| `ResolveCredentials` | Reads each secret, checks it is the managed secret for that exact provider and key, and returns the field value. |
-| `DeleteCredential` | Deactivates the secret (Secret Server soft delete). |
-| `ListCredentials` | Returns `UNIMPLEMENTED`. |
+| `GetCapabilities` | Protocol negotiation (v1.0, `openshell.credentials.contract`). |
+| `StoreCredential` | Creates one secret per credential in a dedicated folder, or updates it in place. |
+| `ResolveCredentials` | Reads the secret, verifies it's the managed one for that exact provider and key, returns the value. |
+| `DeleteCredential` | Deactivates the secret (soft delete, stays in the audit trail). |
+| `ListCredentials` | Not implemented yet. |
 
-- **Handle:** `v1:<secret id>`, plus `object_id` metadata. The gateway stores only this.
-- **Secret name:** `openshell-<first 40 hex of sha256(workspace, provider id, provider, key, object id)>`.
-  Every resolve, update and delete re-checks name and folder, so a handle can't be replayed under
-  another provider or key, or pointed at a secret outside the managed folder.
-- **Refresh writes** with a new `object_id` get their own secret, so a staged value never
-  overwrites the committed one. **Retries** after a partial failure reuse the managed secret.
-- **Deactivated secrets** that the server still returns (`active: false`) are treated as deleted.
+## ✨ Features
 
-## Sign-in
+- **Delinea Platform sign-in** with a service account (client credentials), plus Secret Server
+  application accounts and static bearer tokens.
+- **Replay-proof handles.** A handle is `v1:<secret id>`, and every read re-checks a name derived from
+  workspace, provider, key and write ID. A stolen handle can't unlock another provider's secret or
+  anything outside the managed folder.
+- **Refresh-safe writes.** Staged refresh writes get their own secret; retries reuse the managed one.
+- **Self-configuring.** Discovers the Platform's vault URL and a valid Secret Server site when you don't set them.
+- **Gateway-managed lifecycle.** The gateway can launch and supervise the driver (`command` +
+  `--bind-socket`), or connect to one you run yourself.
 
-- **Delinea Platform service account:** `platform_hostname`, `client_id`, `client_secret`
-  (or `client_secret_file`). Client-credentials grant at
-  `/identity/api/oauth2/token/xpmplatform`, scope `xpmheadless`.
-- **Secret Server application account:** `username`, `password` (or `password_file`), OAuth2
-  password grant.
-- **Bearer token:** `bearer_token` (or `bearer_token_file`), no renewal.
-
-## Set up
+## 🚀 Quickstart
 
 ```bash
-./setup.sh          # venv, dependencies, gRPC stubs from proto/
-.venv/bin/python tests/e2e_test.py
+git clone https://github.com/D1skin/openshell-secret-server-driver.git
+cd openshell-secret-server-driver
+./setup.sh                          # venv, dependencies, gRPC stubs from proto/
+.venv/bin/python tests/e2e_test.py  # 31 checks against a mock Secret Server
 ```
 
-Configure the gateway with `examples/gateway.toml` and the driver with
-`examples/driver-config.json`. Every setting can also come from an `SS_*` environment variable
-(`SS_BASE_URL`, `SS_FOLDER_ID`, `SS_TEMPLATE_ID`, `SS_FIELD_SLUG`, `SS_SITE_ID`,
-`SS_PLATFORM_HOSTNAME`, `SS_CLIENT_ID`, `SS_CLIENT_SECRET_FILE`, `SS_USERNAME`,
-`SS_PASSWORD_FILE`, `SS_CA_BUNDLE`, ...).
+Point the gateway at the driver (`examples/gateway.toml`):
 
-In Secret Server:
+```toml
+[openshell]
+version = 2
 
-1. Create a folder for OpenShell-managed secrets and give the driver's account Owner on it.
-2. Use a template with a password-type field (slug `password` by default). A `notes` field, if
-   present, gets non-secret context: workspace, provider and key.
-3. Don't enable checkout, approval or comment requirements on that folder; the gateway resolves
-   credentials unattended.
-4. Set `site_id` if you know it; otherwise the driver discovers one (see below).
+[openshell.gateway]
+credential_drivers = ["delinea-secret-server"]
 
-## Behavior learned from a real Platform tenant
+[openshell.credential_drivers.delinea-secret-server]
+transport = "uds"
+socket_path = "/var/run/openshell/credential-drivers/delinea-secret-server.sock"
+command = "/opt/delinea/openshell-secret-server-driver/run.sh"
+args = ["--config", "/etc/openshell/delinea-secret-server.json"]
+startup_timeout_secs = 20
+```
 
-- The Secret Server vault behind a Platform tenant is listed at `/vaultbroker/api/vaults` and
-  accepts the Platform service account's token.
-- Creating a secret needs the minimal body: name, template, folder, site and `{fieldId, itemValue}`
-  items. Posting the full stub back is rejected with "The request is invalid."
-- `siteId` is required and must be 1 or higher; stubs return 0. Unless `site_id` is set, the driver
-  uses the first active distributed-engine site, else the site of a secret the account can see.
-- A missing secret returns HTTP 400 `API_AccessDenied`, not 404, so "gone" and "no permission"
-  look the same to the driver.
+Then configure the driver (`examples/driver-config.json`) and prepare Secret Server:
+
+1. Create a folder for OpenShell-managed secrets and give the driver's account **Owner** on it.
+2. Pick a template with a password-type field (slug `password` by default).
+3. Keep checkout, approval and comment requirements off that folder, since the gateway resolves unattended.
+
+## ⚙️ Configuration
+
+Every setting can come from the JSON config or an environment variable.
+
+| Setting | Env var | Notes |
+|---|---|---|
+| `base_url` | `SS_BASE_URL` | Secret Server URL. `https://` required (loopback may use `http://`). |
+| `folder_id` | `SS_FOLDER_ID` | Folder that holds managed secrets. |
+| `template_id` | `SS_TEMPLATE_ID` | Template used for new secrets. |
+| `field_slug` | `SS_FIELD_SLUG` | Field that holds the value. Default `password`. |
+| `site_id` | `SS_SITE_ID` | Optional. Discovered when unset. |
+| `platform_hostname` | `SS_PLATFORM_HOSTNAME` | Delinea Platform tenant, for service-account sign-in. |
+| `client_id` / `client_secret_file` | `SS_CLIENT_ID` / `SS_CLIENT_SECRET_FILE` | Platform service account. |
+| `username` / `password_file` | `SS_USERNAME` / `SS_PASSWORD_FILE` | Secret Server application account. |
+| `bearer_token_file` | `SS_BEARER_TOKEN_FILE` | Static token, no renewal. |
+| `ca_bundle` | `SS_CA_BUNDLE` | Extra CA certificates for private PKI. |
+
+## 🧪 Tests
+
+| Suite | Runs against | What it proves |
+|---|---|---|
+| `tests/e2e_test.py` | Mock Secret Server | The full contract: negotiation, store, batch resolve, update, retry, refresh, rotation, replay and forged-handle refusal, session expiry, delete, audit trail, both sign-in modes, log hygiene. |
+| `./live-test.sh --env-file <file>` | A real Delinea Platform tenant | The same lifecycle against the real vault. Runs the mock suite first and loads only the Platform env file you pass. |
+
+The live test only touches what it creates: an `openshell-itest-<timestamp>` folder (inside a
+folder the account owns if the root is off limits) filled with random test values. Everything is
+removed in `finally`, and leftovers from a crashed run are swept at the start of the next one.
+Results are reported as passed, failed and not run, never "green" by omission.
+
+## 🔒 Security model
+
+- TLS verification is always on. Private CAs go in `ca_bundle`; there is no bypass switch.
+- The socket is owner-only (`0600`) in an owner-only directory. The driver refuses to replace
+  symlinks, non-sockets, or sockets owned by someone else.
+- Secret values and tokens never reach logs or error messages. The test suites check this.
+- Resolved values do still pass through the gateway and the sandbox supervisor's memory; that's
+  OpenShell's design. Secret Server holds them at rest and audits every read.
+
+## 🧭 Lessons from a real Platform tenant
+
+- The vault behind a Platform tenant is listed at `/vaultbroker/api/vaults` and accepts the
+  service account's Platform token.
+- Secret creation wants a minimal body (`name`, template, folder, site, `{fieldId, itemValue}`
+  items). Echoing the full stub back gets "The request is invalid."
+- `siteId` is required (1 or higher) even though stubs return `0`.
+- A missing secret answers `400 API_AccessDenied`, not `404`.
 - Deactivated secrets stay readable with `active: false`.
-- A service account may not be allowed to create root folders; pre-create the driver's folder.
-- A resolve takes about 380 ms against Secret Server Cloud; batch resolves are sequential today.
+- A resolve costs about 380 ms against Secret Server Cloud.
 
-## Tests
+## 🗺️ Roadmap
 
-- `tests/e2e_test.py` launches the driver the way the gateway does (`--bind-socket`), repeats the
-  gateway's readiness and negotiation rules, and runs the contract against `tests/mock_secret_server.py`:
-  store, batch resolve, update, retry, staged refresh, rotation inside Secret Server, replay and
-  forged-handle refusal, session expiry, delete, audit trail, both sign-in modes and log hygiene.
-- `live-test.sh --env-file <file>` runs the mock suite first, then `tests/live_tenant_test.py`
-  against a Delinea Platform tenant with only that env file loaded (it must export
-  `PLATFORM_HOSTNAME`, `PLATFORM_SERVICE_ACCOUNT` and `PLATFORM_SERVICE_PASSWORD`). The live test
-  creates an `openshell-itest-<timestamp>` folder (inside a folder the account owns if the root is
-  refused), stores only random test values, deletes everything in `finally`, and sweeps leftover
-  `openshell-itest-` folders at the start. It reports passed, failed and not-run separately and
-  prints no credentials. Pass `--vault-url` if the vault listing isn't available.
-- `tests/run_mock_server.py` runs the mock standalone for dry runs.
+- [ ] Wet test under a live OpenShell gateway and sandbox
+- [ ] Parallel batch resolves
+- [ ] `ListCredentials`
+- [ ] Go or Rust port for production footprint
+- [ ] Propose upstream to NVIDIA/OpenShell
 
-## Security choices
+## 🤝 Contributing
 
-- TLS certificate and hostname verification are always on. Private CAs go in `ca_bundle`; there
-  is no verification bypass. `http://` is accepted only for loopback addresses.
-- The socket is created owner-only in an owner-only directory. The driver refuses to replace a
-  path that isn't a socket, is a symlink, or belongs to another user.
-- Secret values and tokens are never logged or put into error messages.
+Issues and pull requests are welcome. Please keep credentials, tenant names and local paths out
+of commits, logs and issues; the `.gitignore` blocks common env and credential files.
 
-## Known limits
+## ⚖️ License
 
-1. OpenShell's design moves the resolved value into the gateway and the sandbox supervisor's
-   memory. Secret Server holds it at rest and audits every read.
-2. When a running sandbox picks up a value rotated in Secret Server depends on when the gateway
-   re-resolves credentials.
-3. `ListCredentials` isn't implemented.
-4. Folders with checkout, approval or comment policies aren't supported for unattended resolves.
-5. Python keeps the proof of concept short; a production driver would likely be Go or Rust.
+A license for this project hasn't been chosen yet. The vendored OpenShell protocol files in
+`proto/` are © NVIDIA and licensed under the Apache License 2.0 (see `proto/LICENSE`).
+
+---
+
+<div align="center">
+<sub>Built at Delinea · Unofficial and Delinea-sponsored · Made for the OpenShell community</sub>
+</div>
