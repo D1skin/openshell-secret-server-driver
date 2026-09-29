@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
 # Live test against a Delinea Platform tenant.
 #   1. The mocked suite must pass first; a live failure on top of a mock failure is noise.
 #   2. Only the Platform env file you pass is loaded, and standalone Secret Server

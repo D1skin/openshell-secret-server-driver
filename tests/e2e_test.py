@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
 """End-to-end test: launch the driver the way the OpenShell gateway does and
 exercise the CredentialDriver contract against a mock Secret Server.
 

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
 """Driver configuration: a JSON file, with SS_* environment variables taking precedence."""
 
 import ipaddress

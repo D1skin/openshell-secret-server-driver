@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
 """Minimal Delinea Secret Server REST client (standard library only).
 
 Covers the calls the credential driver needs: OAuth2 password-grant login,

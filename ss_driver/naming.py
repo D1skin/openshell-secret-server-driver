@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
 """Deterministic Secret Server names for gateway-managed provider credentials.
 
 A handle only ever resolves to the secret whose name matches the identity the

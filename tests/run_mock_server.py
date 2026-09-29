@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
 """Run the mock Secret Server as a standalone process (for dry runs of live_tenant_test.py).
 
 Prints its base URL, then serves until interrupted. Test credentials:

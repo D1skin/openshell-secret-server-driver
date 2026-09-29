@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
 """OpenShell CredentialDriver gRPC service backed by Delinea Secret Server.
 
 Each gateway-managed provider credential becomes one Secret Server secret in a

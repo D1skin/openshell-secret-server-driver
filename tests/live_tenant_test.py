@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
 """Live test of the credential driver against a Delinea Platform tenant.
 
 Platform only. Run through live-test.sh, which runs the mock suite first and then

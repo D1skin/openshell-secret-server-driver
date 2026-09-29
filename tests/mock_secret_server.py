@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
 """In-process test double for the Delinea Secret Server REST API subset the driver uses.
 
 Implements: POST /oauth2/token, GET /api/v1/secrets/stub, POST /api/v1/secrets,

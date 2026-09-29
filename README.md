@@ -15,6 +15,7 @@ A credential driver that plugs [Delinea Secret Server](https://delinea.com/produ
 ![live](https://img.shields.io/badge/Delinea%20Platform%20live%20tests-14%2F14-brightgreen)
 ![wet test](https://img.shields.io/badge/OpenShell%20v0.1.2%20wet%20test-passing-brightgreen)
 ![python](https://img.shields.io/badge/python-3.9%2B-3776ab)
+![license](https://img.shields.io/badge/license-MIT-yellow)
 
 </div>
 
@@ -160,12 +161,9 @@ Results are reported as passed, failed and not run, never "green" by omission.
 
 ## 🗺️ Roadmap
 
-- [x] Wet test under a live OpenShell gateway and sandbox
-- [ ] Scripted wet test, including a Delinea Platform backend
 - [ ] Parallel batch resolves
 - [ ] `ListCredentials`, once OpenShell uses it
 - [ ] Go or Rust port for production footprint
-- [ ] Propose upstream to NVIDIA/OpenShell
 
 ## 🤝 Contributing
 
@@ -174,11 +172,11 @@ of commits, logs and issues; the `.gitignore` blocks common env and credential f
 
 ## ⚖️ License
 
-A license for this project hasn't been chosen yet. The vendored OpenShell protocol files in
-`proto/` are © NVIDIA and licensed under the Apache License 2.0 (see `proto/LICENSE`).
+Released under the [MIT License](LICENSE). The vendored OpenShell protocol files in `proto/`
+are © NVIDIA and remain under the Apache License 2.0 (see `proto/LICENSE`).
 
 ---
 
 <div align="center">
-<sub>Built at Delinea · Unofficial and Delinea-sponsored · Made for the OpenShell community</sub>
+<sub>Built at Delinea · Unofficial and Delinea-sponsored · MIT licensed · Made for the OpenShell community</sub>
 </div>

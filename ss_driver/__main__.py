@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
 """Entry point. The OpenShell gateway launches this with `--bind-socket <path>`
 when `command` is set in `[openshell.credential_drivers.<name>]`, or you can run
 it yourself and point the gateway at the socket with `socket_path` only.
