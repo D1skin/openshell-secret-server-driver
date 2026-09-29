@@ -9,7 +9,8 @@ credential_drivers = ["delinea-secret-server"]
 transport = "uds"
 socket_path = "/var/run/openshell/credential-drivers/delinea-secret-server.sock"
 # The gateway launches and supervises the driver, appending --bind-socket <socket_path>.
+# Install it with: UV_TOOL_BIN_DIR=/opt/openshell/bin uv tool install <package or git URL>
 # Omit command/args/startup_timeout_secs to connect to a driver you run yourself.
-command = "/opt/delinea/openshell-secret-server-driver/run.sh"
+command = "/opt/openshell/bin/openshell-secret-server-driver"
 args = ["--config", "/etc/openshell/delinea-secret-server.json"]
 startup_timeout_secs = 20

@@ -40,14 +40,9 @@ import grpc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-for path in (ROOT, os.path.join(ROOT, "generated")):
-    if path not in sys.path:
-        sys.path.insert(0, path)
-
-import credential_driver_pb2 as pb  # noqa: E402
-import credential_driver_pb2_grpc as pb_grpc  # noqa: E402
-import datamodel_pb2  # noqa: E402
-import extension_pb2  # noqa: E402
+from ss_driver._proto import credential_driver_pb2 as pb  # noqa: E402
+from ss_driver._proto import credential_driver_pb2_grpc as pb_grpc  # noqa: E402
+from ss_driver._proto import datamodel_pb2, extension_pb2  # noqa: E402
 from ss_driver.config import DriverConfig  # noqa: E402
 from ss_driver.naming import NAME_PREFIX  # noqa: E402
 from ss_driver.secret_server import SecretServerClient, SecretServerError  # noqa: E402

@@ -14,7 +14,8 @@ A credential driver that plugs [Delinea Secret Server](https://delinea.com/produ
 ![mock suite](https://img.shields.io/badge/mock%20suite-31%2F31-brightgreen)
 ![live](https://img.shields.io/badge/Delinea%20Platform%20live%20tests-14%2F14-brightgreen)
 ![wet test](https://img.shields.io/badge/OpenShell%20v0.1.2%20wet%20test-passing-brightgreen)
-![python](https://img.shields.io/badge/python-3.9%2B-3776ab)
+![python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-3776ab)
+![uv](https://img.shields.io/badge/packaged%20with-uv-de5fe9)
 ![license](https://img.shields.io/badge/license-MIT-yellow)
 
 </div>
@@ -79,14 +80,31 @@ flowchart LR
 
 ## 🚀 Quickstart
 
+Needs [uv](https://docs.astral.sh/uv/). It fetches a suitable Python (3.11+) for you.
+
+Try it without cloning:
+
+```bash
+uvx --from git+https://github.com/D1skin/openshell-secret-server-driver openshell-secret-server-driver --help
+```
+
+Develop and test:
+
 ```bash
 git clone https://github.com/D1skin/openshell-secret-server-driver.git
 cd openshell-secret-server-driver
-./setup.sh                          # venv, dependencies, gRPC stubs from proto/
-.venv/bin/python tests/e2e_test.py  # 31 checks against a mock Secret Server
+uv sync                           # locked dependencies from uv.lock
+uv run python tests/e2e_test.py   # 31 checks against a mock Secret Server
 ```
 
-Point the gateway at the driver (`examples/gateway.toml`):
+For a gateway, install a pinned build as a tool rather than pointing the gateway at `uvx`: the
+gateway gives the driver a few seconds to start, and a cold `uvx` run may be downloading packages.
+
+```bash
+uv tool install git+https://github.com/D1skin/openshell-secret-server-driver@<tag-or-commit>
+```
+
+Point the gateway at the installed executable (`examples/gateway.toml`):
 
 ```toml
 [openshell]
@@ -98,7 +116,8 @@ credential_drivers = ["delinea-secret-server"]
 [openshell.credential_drivers.delinea-secret-server]
 transport = "uds"
 socket_path = "/var/run/openshell/credential-drivers/delinea-secret-server.sock"
-command = "/opt/delinea/openshell-secret-server-driver/run.sh"
+# Absolute path of the executable that `uv tool install` placed on your PATH.
+command = "/opt/openshell/bin/openshell-secret-server-driver"
 args = ["--config", "/etc/openshell/delinea-secret-server.json"]
 startup_timeout_secs = 20
 ```
@@ -130,10 +149,10 @@ Every setting can come from the JSON config or an environment variable.
 
 | Suite | Runs against | What it proves |
 |---|---|---|
-| `tests/e2e_test.py` | Mock Secret Server | The full contract: negotiation, store, batch resolve, update, retry, refresh, rotation, replay and forged-handle refusal, session expiry, delete, audit trail, both sign-in modes, log hygiene. |
+| `uv run python tests/e2e_test.py` | Mock Secret Server | The full contract: negotiation, store, batch resolve, update, retry, refresh, rotation, replay and forged-handle refusal, session expiry, delete, audit trail, both sign-in modes, log hygiene. |
 | `./live-test.sh --env-file <file>` | A real Delinea Platform tenant | The same lifecycle against the real vault. Runs the mock suite first and loads only the Platform env file you pass. |
 
-**Wet test with a real OpenShell v0.1.2 gateway and Docker sandbox** (mock Secret Server backend):
+**Wet test with a real OpenShell v0.1.2 gateway and Docker sandbox**, with the driver installed via `uv tool install` and a mock Secret Server backend:
 
 | Step | Result |
 |---|---|

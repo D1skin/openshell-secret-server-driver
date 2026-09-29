@@ -1,0 +1,48 @@
+[project]
+name = "openshell-secret-server-driver"
+dynamic = ["version"]
+description = "Delinea Secret Server credential driver for NVIDIA OpenShell (proof of concept)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "proto/LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Gal Diskin" }]
+keywords = ["openshell", "delinea", "secret-server", "credential-driver", "ai-agents", "grpc"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+# The committed stubs in ss_driver/_proto were generated with grpcio-tools 1.81.1
+# (protobuf gencode 6.33.5) and refuse to load on older runtimes.
+dependencies = [
+    "grpcio>=1.81.1,<2",
+    "protobuf>=6.33.5,<7",
+]
+
+[project.urls]
+Repository = "https://github.com/D1skin/openshell-secret-server-driver"
+
+[project.scripts]
+openshell-secret-server-driver = "ss_driver.__main__:main"
+
+[dependency-groups]
+dev = ["grpcio-tools==1.81.1"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "ss_driver/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ss_driver"]
+
+[tool.hatch.build.targets.sdist]
+include = ["ss_driver", "proto", "tests", "examples", "gen_protos.sh", "live-test.sh", "README.md", "LICENSE"]

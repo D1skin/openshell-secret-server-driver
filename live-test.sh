@@ -16,8 +16,8 @@ if [ -z "$env_file" ] || [ ! -f "$env_file" ]; then
   exit 2
 fi
 
-unit_log="$(mktemp -t ssd-unit)"
-if ! "$here/.venv/bin/python" "$here/tests/e2e_test.py" >"$unit_log" 2>&1; then
+unit_log="$(mktemp -t ssd-unit.XXXXXX)"
+if ! uv run --project "$here" python "$here/tests/e2e_test.py" >"$unit_log" 2>&1; then
   echo "mock suite failed; not running live tests. Output: $unit_log"
   tail -5 "$unit_log"
   exit 1
@@ -30,4 +30,4 @@ set -a
 # shellcheck disable=SC1090
 source "$env_file"
 set +a
-exec "$here/.venv/bin/python" "$here/tests/live_tenant_test.py" "$@"
+exec uv run --project "$here" python "$here/tests/live_tenant_test.py" "$@"

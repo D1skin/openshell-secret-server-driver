@@ -16,9 +16,8 @@ from concurrent import futures
 
 import grpc
 
-import credential_driver_pb2_grpc as pb_grpc
-
 from . import __version__
+from ._proto import credential_driver_pb2_grpc as pb_grpc
 from .config import ConfigError, load_config
 from .secret_server import SecretServerClient
 from .service import CredentialDriverService

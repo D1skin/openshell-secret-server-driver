@@ -21,15 +21,13 @@ import grpc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-for path in (ROOT, os.path.join(ROOT, "generated"), HERE):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)  # the mock lives next to this file
 
-import credential_driver_pb2 as pb  # noqa: E402
-import credential_driver_pb2_grpc as pb_grpc  # noqa: E402
-import datamodel_pb2  # noqa: E402
-import extension_pb2  # noqa: E402
 import mock_secret_server as mock  # noqa: E402
+from ss_driver._proto import credential_driver_pb2 as pb  # noqa: E402
+from ss_driver._proto import credential_driver_pb2_grpc as pb_grpc  # noqa: E402
+from ss_driver._proto import datamodel_pb2, extension_pb2  # noqa: E402
 
 CONTRACT = "openshell.credentials.contract"
 CONFIGURED_DRIVER_NAME = "delinea-secret-server"

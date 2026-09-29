@@ -13,12 +13,10 @@ from typing import Any, Dict, Optional
 
 import grpc
 
-import credential_driver_pb2 as pb
-import credential_driver_pb2_grpc as pb_grpc
-import datamodel_pb2
-import extension_pb2
-
 from . import __version__
+from ._proto import credential_driver_pb2 as pb
+from ._proto import credential_driver_pb2_grpc as pb_grpc
+from ._proto import datamodel_pb2, extension_pb2
 from .config import DriverConfig
 from .naming import managed_secret_name, requested_object_id
 from .secret_server import SecretServerClient, SecretServerError
