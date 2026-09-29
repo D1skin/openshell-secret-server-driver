@@ -13,6 +13,7 @@ A credential driver that plugs [Delinea Secret Server](https://delinea.com/produ
 ![protocol](https://img.shields.io/badge/driver%20protocol-v1.0-blue)
 ![mock suite](https://img.shields.io/badge/mock%20suite-31%2F31-brightgreen)
 ![live](https://img.shields.io/badge/Delinea%20Platform%20live%20tests-14%2F14-brightgreen)
+![wet test](https://img.shields.io/badge/OpenShell%20v0.1.2%20wet%20test-passing-brightgreen)
 ![python](https://img.shields.io/badge/python-3.9%2B-3776ab)
 
 </div>
@@ -131,6 +132,18 @@ Every setting can come from the JSON config or an environment variable.
 | `tests/e2e_test.py` | Mock Secret Server | The full contract: negotiation, store, batch resolve, update, retry, refresh, rotation, replay and forged-handle refusal, session expiry, delete, audit trail, both sign-in modes, log hygiene. |
 | `./live-test.sh --env-file <file>` | A real Delinea Platform tenant | The same lifecycle against the real vault. Runs the mock suite first and loads only the Platform env file you pass. |
 
+**Wet test with a real OpenShell v0.1.2 gateway and Docker sandbox** (mock Secret Server backend):
+
+| Step | Result |
+|---|---|
+| Gateway launches the driver and negotiates | `delinea-secret-server (credential-driver)`, protocol 1.0 |
+| `openshell provider create` | Value stored through the driver; the gateway database holds no copy |
+| Sandbox start | Gateway resolves the credential through the driver (audited as a read) |
+| Agent inside the sandbox | Sees only `openshell:resolve:env:…` placeholders |
+| Request to the approved endpoint | Arrives with the real value, injected by the supervisor |
+| Rotate in Secret Server, start a new sandbox | New sandbox gets the rotated value, no OpenShell change |
+| `openshell provider delete` | Secret deactivated in Secret Server |
+
 The live test only touches what it creates: an `openshell-itest-<timestamp>` folder (inside a
 folder the account owns if the root is off limits) filled with random test values. Everything is
 removed in `finally`, and leftovers from a crashed run are swept at the start of the next one.
@@ -158,7 +171,8 @@ Results are reported as passed, failed and not run, never "green" by omission.
 
 ## 🗺️ Roadmap
 
-- [ ] Wet test under a live OpenShell gateway and sandbox
+- [x] Wet test under a live OpenShell gateway and sandbox
+- [ ] Scripted wet test, including a Delinea Platform backend
 - [ ] Parallel batch resolves
 - [ ] `ListCredentials`
 - [ ] Go or Rust port for production footprint
