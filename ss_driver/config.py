@@ -5,13 +5,18 @@
 import ipaddress
 import json
 import os
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 
 class ConfigError(ValueError):
     pass
+
+
+# Secret Server field slugs: letters, digits, dot, dash and underscore.
+SLUG_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,12 @@ class DriverConfig:
     client_id: Optional[str] = None
     client_secret: Optional[str] = field(default=None, repr=False)
     site_id: Optional[int] = None
+    # Folders whose existing secrets OpenShell providers may reference with
+    # secretserver:<id>. Empty disables references.
+    reference_folder_ids: Tuple[int, ...] = ()
+    # Send an audit comment naming the provider, key and workspace with every
+    # read, with automatic check-out and check-in (Secret Server 11.1 and later).
+    audit_comments: bool = True
     ca_bundle: Optional[str] = None
     timeout_secs: float = 15.0
 
@@ -52,6 +63,8 @@ _ENV = {
     "client_secret": "SS_CLIENT_SECRET",
     "client_secret_file": "SS_CLIENT_SECRET_FILE",
     "site_id": "SS_SITE_ID",
+    "reference_folder_ids": "SS_REFERENCE_FOLDER_IDS",
+    "audit_comments": "SS_AUDIT_COMMENTS",
     "ca_bundle": "SS_CA_BUNDLE",
     "timeout_secs": "SS_TIMEOUT_SECS",
 }
@@ -82,6 +95,30 @@ def _checked_url(value: str, name: str) -> str:
     if parsed.scheme == "http" and not _is_loopback(parsed.hostname):
         raise ConfigError(f"{name} must use https:// unless it points at a loopback address")
     return value
+
+
+def _int_tuple(value: Any, name: str) -> Tuple[int, ...]:
+    if value in (None, "", []):
+        return ()
+    items = value if isinstance(value, list) else str(value).split(",")
+    try:
+        ids = tuple(int(str(item).strip()) for item in items if str(item).strip())
+    except ValueError as err:
+        raise ConfigError(f"{name} must be a list of folder IDs") from err
+    if any(i <= 0 for i in ids):
+        raise ConfigError(f"{name} must contain positive folder IDs")
+    return ids
+
+
+def _as_bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{name} must be true or false")
 
 
 def load_config(path: Optional[str]) -> DriverConfig:
@@ -133,8 +170,8 @@ def load_config(path: Optional[str]) -> DriverConfig:
         )
 
     field_slug = str(raw.get("field_slug") or "password").strip()
-    if not field_slug:
-        raise ConfigError("field_slug must not be empty")
+    if not re.fullmatch(SLUG_PATTERN, field_slug):
+        raise ConfigError("field_slug must be a Secret Server field slug such as 'password'")
 
     site_id = None
     if raw.get("site_id") not in (None, ""):
@@ -145,9 +182,17 @@ def load_config(path: Optional[str]) -> DriverConfig:
         if site_id <= 0:
             raise ConfigError("site_id must be a positive Secret Server site ID")
 
+    reference_folder_ids = _int_tuple(raw.get("reference_folder_ids"), "reference_folder_ids")
+    if folder_id in reference_folder_ids:
+        # Otherwise one provider could attach another provider's managed secret by ID.
+        raise ConfigError("reference_folder_ids must not include folder_id, the driver's own folder")
+    audit_comments = _as_bool(raw.get("audit_comments", True), "audit_comments")
+
     return DriverConfig(
         base_url=base_url,
         site_id=site_id,
+        reference_folder_ids=reference_folder_ids,
+        audit_comments=audit_comments,
         folder_id=folder_id,
         template_id=template_id,
         field_slug=field_slug,

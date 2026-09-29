@@ -3,6 +3,8 @@
   "folder_id": 42,
   "template_id": 6001,
   "field_slug": "password",
+  "reference_folder_ids": [57],
+  "audit_comments": true,
   "username": "svc-openshell-driver",
   "password_file": "/etc/openshell/delinea-secret-server.password",
   "ca_bundle": "/etc/openshell/delinea-secret-server-ca.pem",

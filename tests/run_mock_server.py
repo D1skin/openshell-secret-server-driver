@@ -24,7 +24,7 @@ if __name__ == "__main__":
         fid, name = spec.split("=", 1)
         state.folders[int(fid)] = name
     if os.environ.get("MOCK_SEED_SECRET_FOLDER"):
-        state.add_secret("mcp-live-test-secret", int(os.environ["MOCK_SEED_SECRET_FOLDER"]), "mock-live-value")
+        state.add_secret("live-test-seed-secret", int(os.environ["MOCK_SEED_SECRET_FOLDER"]), "mock-live-value")
     print(base_url, flush=True)
     try:
         while True:

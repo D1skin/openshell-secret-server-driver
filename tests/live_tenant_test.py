@@ -16,12 +16,13 @@ OPENSHELL_PLATFORM_VAULT_URL; otherwise the test tries the Platform vault-broker
 listing (/vaultbroker/api/vaults) and stops with instructions if that fails.
 
 Safety contract: the test mutates only
-resources it creates. It creates a folder named openshell-itest-<timestamp>,
-stores random test values in it through the driver, and in a finally block
-deactivates those secrets and deletes the folder. A sweep at the start of each
-run removes anything left under the openshell-itest- prefix. If the account
-can't create a folder, only read-only checks run and the write path is reported
-as not verified.
+resources it creates. It creates a folder named openshell-itest-<timestamp> and,
+inside it, an openshell-itest-<timestamp>-security folder that plays the security
+team's folder. It stores random test values through the driver, attaches a test
+secret by reference, and in a finally block deactivates those secrets and deletes
+both folders. A sweep at the start of each run removes anything left under the
+openshell-itest- prefix. If the account can't create a folder, only read-only
+checks run and the write path is reported as not verified.
 """
 
 import argparse
@@ -228,6 +229,75 @@ def remove_test_folder(client, folder_id, label):
     return ok
 
 
+def run_references(stub, setup, folder_id, security_folder_id, template_id, slug, values):
+    """Attach a secret the 'security team' owns, without the driver ever copying it."""
+    identity = dict(provider="openshell-itest-orders", credential_key="ITEST_ORDERS_KEY", workspace=TEST_WORKSPACE,
+                    provider_id=str(uuid.uuid4()))
+    slugs = setup.template_slugs(template_id, security_folder_id)
+    extra = {k: v for k, v in (("username", "itest-orders-svc"), ("resource", "https://orders.example.invalid"))
+             if k in slugs}
+    stamp = int(time.time())
+    security_id = setup.create_simple_secret(f"{TEST_PREFIX}security-{stamp}", template_id, security_folder_id,
+                                             dict(extra, **{slug: values[0]}))
+    decoy_id = setup.create_simple_secret(f"{TEST_PREFIX}decoy-{stamp}", template_id, folder_id,
+                                          dict(extra, **{slug: values[2]}))
+    print(f"      created test secret {security_id} in the security folder and decoy {decoy_id} in the driver's folder")
+    stored_before = set(setup.active_secret_ids(folder_id, NAME_PREFIX))
+    try:
+        handle = stamped(stub.StoreCredential(pb.StoreCredentialRequest(
+            value=f"secretserver:{security_id}", **identity), timeout=30).handle)
+    except grpc.RpcError as err:
+        check("attaching a secret by reference returns a pointer", False, f"{err.code().name}: {err.details()}")
+        return
+    copies = set(setup.active_secret_ids(folder_id, NAME_PREFIX)) - stored_before
+    check("attaching a secret by reference returns a pointer and copies nothing",
+          handle.handle == f"ref1:{security_id}/{slug}" and not copies, handle.handle)
+
+    def resolve(ident=None, h=None):
+        return stub.ResolveCredentials(pb.ResolveCredentialsRequest(credentials=[
+            pb.ResolveCredentialRequest(request_id="ref", handle=h or handle, **(ident or identity))]),
+            timeout=30).credentials[0].value
+
+    check("the attached secret resolves to its owner's value", resolve() == values[0])
+    setup.update_field(security_id, slug, values[1])
+    check("a change made in Secret Server reaches the next resolve", resolve() == values[1])
+    for name, call, code in (
+        ("a raw value can't overwrite the attached secret",
+         lambda: stub.StoreCredential(pb.StoreCredentialRequest(value=values[2], existing_handle=handle, **identity),
+                                      timeout=30), grpc.StatusCode.FAILED_PRECONDITION),
+        ("a secret outside reference_folder_ids can't be attached",
+         lambda: stub.StoreCredential(pb.StoreCredentialRequest(value=f"secretserver:{decoy_id}", **identity),
+                                      timeout=30), grpc.StatusCode.PERMISSION_DENIED),
+        ("a reference handle replayed under another provider is refused",
+         lambda: resolve(dict(identity, provider_id=str(uuid.uuid4()))), grpc.StatusCode.INVALID_ARGUMENT),
+    ):
+        try:
+            call()
+            check(name, False, "call succeeded")
+        except grpc.RpcError as err:
+            check(name, err.code() == code, f"{err.code().name}: {err.details()}")
+    check("the attached secret still holds its owner's value", setup.get_field(security_id, slug) == values[1])
+    stub.DeleteCredential(pb.DeleteCredentialRequest(handle=handle, **identity), timeout=30)
+    check("deleting the provider leaves the attached secret active",
+          setup.get_secret(security_id).get("active", True) is not False)
+
+    try:
+        records = setup.secret_audits(security_id, take=50)
+    except SecretServerError as err:
+        skip("audit comment on each OpenShell read", f"couldn't read the secret's audit ({err})")
+        return
+    actions = sorted({str(r.get("action", "")).upper() for r in records})
+    print(f"      audit of secret {security_id}: {len(records)} records, actions {', '.join(actions)}")
+    tagged = [r for r in records if "OpenShell resolve" in str(r.get("notes") or "")]
+    if tagged:
+        check("each OpenShell read is audited with its provider, key and workspace", True,
+              str(tagged[0].get("notes"))[:120])
+    else:
+        skip("audit comment on each OpenShell read",
+             "Secret Server recorded the reads but not the autoComment; it records comments on check-out and "
+             "check-in, so try a secret with Require Check Out enabled")
+
+
 def summary():
     passed = sum(1 for _, ok in results if ok)
     failed = len(results) - passed
@@ -334,8 +404,9 @@ def main():
         fail_setup(f"no template named '{args.template_name}'; pass --template-id")
 
     # Sweep leftovers from crashed runs, then create this run's folder.
-    for folder in setup.folders_with_prefix(TEST_PREFIX):
-        remove_test_folder(setup, int(folder["id"]), "pre-run sweep")
+    leftovers = setup.folders_with_prefix(TEST_PREFIX)
+    for folder in sorted(leftovers, key=lambda f: -len(str(f.get("folderPath") or f.get("folderName") or ""))):
+        remove_test_folder(setup, int(folder["id"]), "pre-run sweep")  # subfolders first
     folder_id = None
     folder_name = f"{TEST_PREFIX}{int(time.time())}"
     try:
@@ -347,10 +418,20 @@ def main():
         if args.parent_folder_id <= 0:
             folder_id = create_test_subfolder(setup, folder_name)
 
-    values = ["itest-" + pysecrets.token_hex(16) for _ in range(3)]
+    security_folder_id = None
+    if folder_id:
+        try:
+            security_folder_id = setup.create_folder(f"{folder_name}-security", folder_id)
+            print(f"      created the security team's test folder inside it (id {security_folder_id})")
+        except SecretServerError as err:
+            print(f"      can't create the security test folder: {err}")
+
+    values = ["itest-" + pysecrets.token_hex(16) for _ in range(6)]
     config_folder = folder_id or 1
     child_env = dict(os.environ, PYTHONPATH=ROOT, SS_BASE_URL=vault_url, SS_FOLDER_ID=str(config_folder),
                      SS_TEMPLATE_ID=str(template_id), SS_FIELD_SLUG=args.field_slug, **env)
+    if security_folder_id:
+        child_env["SS_REFERENCE_FOLDER_IDS"] = str(security_folder_id)
     for key in ("DELINEA_USERNAME", "DELINEA_USER", "DELINEA_PASSWORD", "DELINEA_BASE_URL"):
         child_env.pop(key, None)
     proc, stub, caps, log_file, log_path = start_driver(child_env)
@@ -365,7 +446,16 @@ def main():
             except SecretServerError as err:
                 check("template has the configured secret field", False, str(err))
             run_writes(stub, client_for(vault_url, env, folder_id, template_id, args.field_slug),
-                       folder_id, template_id, args.field_slug, values)
+                       folder_id, template_id, args.field_slug, values[:3])
+            if security_folder_id:
+                try:
+                    run_references(stub, setup, folder_id, security_folder_id, template_id, args.field_slug,
+                                   values[3:])
+                except SecretServerError as err:
+                    check("reference setup in the security test folder", False, str(err))
+            else:
+                skip("references: attach, rotate, refuse raw overwrite, detach, audit comment",
+                     "couldn't create the security test folder")
         else:
             skip("write path: store, resolve, update, retry, replay refusal, delete",
                  "the service account can't create a test folder anywhere in the vault; give it Owner "
@@ -384,6 +474,8 @@ def main():
                       f"{err.code().name}: {err.details()}")
     finally:
         stop_driver(proc, log_file)
+        if security_folder_id:
+            remove_test_folder(setup, security_folder_id, "cleanup")
         if folder_id:
             remove_test_folder(setup, folder_id, "cleanup")
 

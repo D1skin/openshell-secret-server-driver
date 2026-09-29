@@ -16,6 +16,11 @@ ORDERS = {
 }
 
 
+def masked(key):
+    """Enough of the key to tell one from another on screen."""
+    return f"{key[:10]}…{key[-4:]}" if len(key) > 16 else f"…{key[-4:]}"
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         return
@@ -38,7 +43,7 @@ class Handler(BaseHTTPRequestHandler):
         if key.startswith("openshell:resolve:"):
             print(f"{DIM}[{stamp}]{RESET} {self.command} {self.path}  {YELLOW}placeholder, not a key -> 401{RESET}", flush=True)
             return self.reply(401, {"error": "invalid API key"})
-        print(f"{DIM}[{stamp}]{RESET} {self.command} {self.path}  key={BOLD}{key}{RESET}  {GREEN}authorized{RESET}", flush=True)
+        print(f"{DIM}[{stamp}]{RESET} {self.command} {self.path}  key={BOLD}{masked(key)}{RESET}  {GREEN}authorized{RESET}", flush=True)
         order_id = self.path.rstrip("/").rsplit("/", 1)[-1]
         if self.path.startswith("/v1/orders/") and order_id in ORDERS:
             return self.reply(200, ORDERS[order_id])

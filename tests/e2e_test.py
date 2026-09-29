@@ -28,10 +28,14 @@ import mock_secret_server as mock  # noqa: E402
 from ss_driver._proto import credential_driver_pb2 as pb  # noqa: E402
 from ss_driver._proto import credential_driver_pb2_grpc as pb_grpc  # noqa: E402
 from ss_driver._proto import datamodel_pb2, extension_pb2  # noqa: E402
+from ss_driver.config import ConfigError, DriverConfig, load_config  # noqa: E402
+from ss_driver.naming import reference_binding  # noqa: E402
+from ss_driver.secret_server import SecretServerClient  # noqa: E402
 
 CONTRACT = "openshell.credentials.contract"
 CONFIGURED_DRIVER_NAME = "delinea-secret-server"
 FOLDER_ID = 42
+SECURITY_FOLDER_ID = 77  # a folder the security team owns; the driver may only read from it
 SS_USER = "svc-openshell-driver"
 SS_PASSWORD = "Pa55-for-the-driver-account"
 PLATFORM_CLIENT_ID = "openshell-driver@tenant"
@@ -102,6 +106,44 @@ def mock_get(base_url, path):
         return json.loads(response.read() or b"null")
 
 
+def password_of(state, secret_id):
+    return next(i["itemValue"] for i in state.secrets[secret_id]["items"] if i["slug"] == "password")
+
+
+def config_checks(workdir):
+    print("-- configuration --")
+    path = os.path.join(workdir, "config-check.json")
+    base = {"base_url": "https://vault.example.com", "folder_id": FOLDER_ID, "template_id": mock.TEMPLATE_ID,
+            "username": "u", "password": "p"}
+
+    def load(extra, env=None):
+        with open(path, "w") as handle:
+            json.dump(dict(base, **extra), handle)
+        saved = {name: os.environ.get(name) for name in env or {}}
+        os.environ.update(env or {})
+        try:
+            return load_config(path)
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    config = load({})
+    check("references are off and audit comments on by default",
+          config.reference_folder_ids == () and config.audit_comments)
+    config = load({}, {"SS_REFERENCE_FOLDER_IDS": "77, 78", "SS_AUDIT_COMMENTS": "false"})
+    check("SS_REFERENCE_FOLDER_IDS and SS_AUDIT_COMMENTS are read from the environment",
+          config.reference_folder_ids == (77, 78) and not config.audit_comments)
+    try:
+        load({"reference_folder_ids": [FOLDER_ID]})
+        check("the driver's own folder can't be a reference folder", False)
+    except ConfigError as err:
+        check("the driver's own folder can't be a reference folder", True, str(err))
+    print()
+
+
 def platform_phase(base_url, state, workdir):
     """Same driver, authenticating as a Delinea Platform service account."""
     print("\n-- Delinea Platform service-account login --")
@@ -147,6 +189,10 @@ def platform_phase(base_url, state, workdir):
             check("platform login uses client credentials only",
                   new_grants and all(grant == "client_credentials" for grant in new_grants),
                   ", ".join(new_grants))
+            ok, detail = expect_error(lambda: stub.StoreCredential(pb.StoreCredentialRequest(
+                value="secretserver:1000", **dict(identity, credential_key="OTHER_KEY")), timeout=10),
+                grpc.StatusCode.FAILED_PRECONDITION)
+            check("references are refused when reference_folder_ids is empty", ok, detail)
             stub.DeleteCredential(pb.DeleteCredentialRequest(handle=handle, **identity), timeout=10)
         finally:
             driver.send_signal(signal.SIGTERM)
@@ -163,6 +209,7 @@ def platform_phase(base_url, state, workdir):
 def main():
     server, state, base_url = mock.start({SS_USER: SS_PASSWORD}, {PLATFORM_CLIENT_ID: PLATFORM_CLIENT_SECRET})
     workdir = tempfile.mkdtemp(prefix="ssd-")
+    config_checks(workdir)
     socket_path = os.path.join(workdir, "run", "secret-server.sock")
     password_file = os.path.join(workdir, "ss-password")
     with open(os.open(password_file, os.O_WRONLY | os.O_CREAT, 0o600), "w") as handle:
@@ -176,6 +223,7 @@ def main():
             "field_slug": "password",
             "username": SS_USER,
             "password_file": password_file,
+            "reference_folder_ids": [SECURITY_FOLDER_ID],
         }, handle)
     log_path = os.path.join(workdir, "driver.log")
 
@@ -327,13 +375,106 @@ def main():
             check("deleting a deactivated-but-readable secret again is a no-op", False, err.details())
         mock_post(base_url, "/_test/inactive-readable", {"enabled": False})
 
-        # 10. audit trail in Secret Server
+        # 10. a secret the security team owns, attached by reference
+        security_value = "acme_live_security_owned"
+        sec_id = state.add_secret("Acme Orders API (production)", SECURITY_FOLDER_ID, security_value,
+                                  extra={"username": "orders-svc"})
+        orders = dict(provider="acme-orders", credential_key="ORDERS_API_KEY", workspace="default",
+                      provider_id=str(uuid.uuid4()))
+        secrets_before = len(state.secrets)
+        ref = as_gateway_handle(stub.StoreCredential(
+            pb.StoreCredentialRequest(value=f"secretserver:{sec_id}", **orders), timeout=10).handle)
+        copies = [s["id"] for s in state.secrets.values()
+                  if s["id"] != sec_id and any(i.get("itemValue") == security_value for i in s["items"])]
+        check("attaching an existing secret returns a pointer and copies nothing",
+              ref.handle == f"ref1:{sec_id}/password" and len(state.secrets) == secrets_before and not copies,
+              ref.handle)
+        check("the attached secret resolves to the security team's value", resolve(ref, orders) == security_value)
+        mock_post(base_url, f"/_test/rotate/{sec_id}", {"value": "acme_live_rotated_by_security"})
+        check("a rotation by the secret's owner reaches the next resolve",
+              resolve(ref, orders) == "acme_live_rotated_by_security")
+        orders_user = dict(orders, credential_key="ORDERS_API_USER")
+        user_ref = as_gateway_handle(stub.StoreCredential(
+            pb.StoreCredentialRequest(value=f"secretserver:{sec_id}/username", **orders_user), timeout=10).handle)
+        check("a reference can name the field to use", resolve(user_ref, orders_user) == "orders-svc", user_ref.handle)
+
+        outside_id = state.add_secret("payroll-db", 99, "payroll-db-root-password")
+        ok, detail = expect_error(lambda: stub.StoreCredential(
+            pb.StoreCredentialRequest(value=f"secretserver:{outside_id}", **orders), timeout=10),
+            grpc.StatusCode.PERMISSION_DENIED)
+        check("a secret outside reference_folder_ids can't be attached", ok, detail)
+        ok, detail = expect_error(lambda: stub.StoreCredential(
+            pb.StoreCredentialRequest(value=f"secretserver:{gh_id}", **orders), timeout=10),
+            grpc.StatusCode.PERMISSION_DENIED)
+        check("another provider's stored secret can't be attached by ID", ok, detail)
+        ok, detail = expect_error(lambda: stub.StoreCredential(
+            pb.StoreCredentialRequest(value="secretserver:12ab", **orders), timeout=10),
+            grpc.StatusCode.INVALID_ARGUMENT)
+        check("a malformed reference is refused", ok, detail)
+
+        ok, detail = expect_error(lambda: resolve(ref, dict(orders, provider_id=github["provider_id"])),
+                                  grpc.StatusCode.INVALID_ARGUMENT)
+        check("a reference handle replayed under another provider is refused", ok, detail)
+        forged_binding = reference_binding(orders["workspace"], orders["provider_id"], orders["provider"],
+                                           orders["credential_key"], orders["provider_id"], outside_id, "password")
+        forged_ref = datamodel_pb2.CredentialHandle(
+            driver=CONFIGURED_DRIVER_NAME, handle=f"ref1:{outside_id}/password",
+            metadata={"object_id": orders["provider_id"], "binding": forged_binding})
+        ok, detail = expect_error(lambda: resolve(forged_ref, orders), grpc.StatusCode.PERMISSION_DENIED)
+        check("a forged reference to a secret outside the allowed folders is refused", ok, detail)
+
+        ok, detail = expect_error(lambda: stub.StoreCredential(pb.StoreCredentialRequest(
+            value="acme_live_pasted_by_hand", existing_handle=ref, **orders), timeout=10),
+            grpc.StatusCode.FAILED_PRECONDITION)
+        check("a raw value can't overwrite an attached secret",
+              ok and password_of(state, sec_id) == "acme_live_rotated_by_security", detail)
+        oa_id = int(oa_handle.handle.split(":", 1)[1])
+        switched = as_gateway_handle(stub.StoreCredential(pb.StoreCredentialRequest(
+            value=f"secretserver:{sec_id}", existing_handle=oa_handle, **openai), timeout=10).handle)
+        check("switching a stored value to a reference retires the driver's copy",
+              switched.handle.startswith("ref1:") and state.secrets[oa_id]["active"] is False
+              and resolve(switched, openai) == "acme_live_rotated_by_security")
+        stub.DeleteCredential(pb.DeleteCredentialRequest(handle=ref, **orders), timeout=10)
+        check("deleting the provider detaches the secret and never deactivates it",
+              state.secrets[sec_id]["active"] is True
+              and not any(e["action"] == "DEACTIVATE" and e["secretId"] == sec_id for e in state.audit))
+
+        mock_post(base_url, f"/_test/secret-flags/{sec_id}", {"folderId": 99})
+        ok, detail = expect_error(lambda: resolve(switched, openai), grpc.StatusCode.PERMISSION_DENIED)
+        check("moving the secret out of an allowed folder cuts OpenShell off", ok, detail)
+        mock_post(base_url, f"/_test/secret-flags/{sec_id}", {"folderId": SECURITY_FOLDER_ID, "active": False})
+        ok, detail = expect_error(lambda: resolve(switched, openai), grpc.StatusCode.NOT_FOUND)
+        check("deactivating the secret in Secret Server cuts OpenShell off", ok, detail)
+        mock_post(base_url, f"/_test/secret-flags/{sec_id}", {"active": True, "requiresComment": True})
+        check("a secret that requires a comment is readable, because every read carries one",
+              resolve(switched, openai) == "acme_live_rotated_by_security")
+        mock_post(base_url, f"/_test/secret-flags/{sec_id}", {"requiresComment": False, "checkOutEnabled": True})
+        check("a secret that requires checkout is checked out and back in around the read",
+              resolve(switched, openai) == "acme_live_rotated_by_security"
+              and {"CHECKOUT", "CHECKIN"} <= {e["action"] for e in state.audit if e["secretId"] == sec_id})
+        mock_post(base_url, f"/_test/secret-flags/{sec_id}", {"checkOutChangePasswordEnabled": True})
+        ok, detail = expect_error(lambda: resolve(switched, openai), grpc.StatusCode.FAILED_PRECONDITION)
+        check("a secret that changes its password on check-in is refused", ok, detail)
+        mock_post(base_url, f"/_test/secret-flags/{sec_id}",
+                  {"checkOutEnabled": False, "checkOutChangePasswordEnabled": False})
+
+        # 11. audit trail in Secret Server
         audit = mock_get(base_url, "/_test/audit")
         driver_actions = {entry["action"] for entry in audit if entry["user"] == SS_USER}
         check("Secret Server audit records the driver's creates, reads, edits and deactivations",
               {"CREATE", "VIEW", "EDIT", "DEACTIVATE"} <= driver_actions, ", ".join(sorted(driver_actions)))
-        views = sum(1 for entry in audit if entry["user"] == SS_USER and entry["action"] == "VIEW")
-        print(f"      audit: {len(audit)} events, {views} secret views by {SS_USER}")
+        views = [e for e in audit if e["user"] == SS_USER and e["action"] == "VIEW"]
+        expected_note = "OpenShell resolve: provider=acme-orders key=ORDERS_API_KEY workspace=default"
+        check("every read carries an audit comment naming the provider, key and workspace",
+              views and all(e["notes"].startswith("OpenShell ") for e in views)
+              and any(e["notes"] == expected_note for e in views), expected_note)
+        reader = SecretServerClient(DriverConfig(base_url=base_url, folder_id=FOLDER_ID, template_id=mock.TEMPLATE_ID,
+                                                 username=SS_USER, password=SS_PASSWORD))
+        records = reader.secret_audits(sec_id)
+        check("the secret's audit shows each OpenShell read with its context",
+              any(r["action"] == "VIEW" and r["notes"] == expected_note for r in records),
+              f"{len(records)} audit records for secret {sec_id}")
+        print(f"      audit: {len(audit)} events, {len(views)} secret views by {SS_USER}")
     finally:
         driver.send_signal(signal.SIGTERM)
         try:
@@ -349,6 +490,8 @@ def main():
     leaked = [value for value in (
         "ghp_poc_value_1", "ghp_poc_value_2", "ghp_poc_value_3", "ghp_staged_refresh",
         "ghp_rotated_by_secret_server", "sk-poc-openai-value", "prod-db-root-password", "xoxb-poc-value", SS_PASSWORD,
+        "acme_live_security_owned", "acme_live_rotated_by_security", "payroll-db-root-password",
+        "acme_live_pasted_by_hand",
     ) + tuple(state.tokens.keys()) if value in log_text]
     check("driver log contains no secret values, passwords or tokens", not leaked,
           f"{len(log_text.splitlines())} log lines checked")

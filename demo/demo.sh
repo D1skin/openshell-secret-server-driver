@@ -7,6 +7,8 @@
 #   demo/demo.sh up --env-file <platform.env> [--vault-url https://...]   # real Platform vault
 #   demo/demo.sh up --mock                                                # mock Secret Server
 #   demo/demo.sh api                                                      # the Acme Orders API (foreground)
+#   demo/demo.sh gateway-db                                               # what the gateway stores
+#   demo/demo.sh security rotate|revoke|restore|audit                     # mock mode: play security
 #   demo/demo.sh status
 #   demo/demo.sh down [--purge]
 #
@@ -101,11 +103,12 @@ start_mock() {
   [[ "$url" == http* ]] || die "mock Secret Server did not start; see $DEMO_HOME/logs/mock.log"
   # The platform host must differ from the vault host for vault discovery.
   export SS_PLATFORM_HOSTNAME="http://localhost:${url##*:}" SS_CLIENT_ID="mock-svc" SS_CLIENT_SECRET="mock-client-secret"
+  MOCK_URL="$url"
   say "mock Secret Server at $url"
 }
 
 cmd_up() {
-  local env_file="" mock=0 vault_url=""
+  local env_file="" mock=0 vault_url="" MOCK_URL=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --env-file) env_file="${2:-}"; shift 2 ;;
@@ -132,11 +135,13 @@ cmd_up() {
 
   if [ "$mock" = 1 ]; then start_mock; else load_platform_credentials "$env_file"; fi
   [ -n "$vault_url" ] && export SS_BASE_URL="$vault_url"
-  say "preparing the vault (template, demo folder)"
-  local setup; setup="$(cd "$repo" && DEMO_FOLDER_NAME="${DEMO_FOLDER_NAME:-OpenShell Agents}" uv run --quiet python demo/vault_setup.py)"
+  say "preparing the vault (template, the driver's folder, the security team's folder and secret)"
+  local setup; setup="$(cd "$repo" && uv run --quiet python demo/vault_setup.py)"
   eval "$setup"
+  # The driver may read existing secrets only from the security team's folder.
   cat > "$DEMO_HOME/config/driver.json" <<EOF
-{"base_url": "$VAULT_URL", "folder_id": $FOLDER_ID, "template_id": $TEMPLATE_ID, "field_slug": "password"}
+{"base_url": "$VAULT_URL", "folder_id": $FOLDER_ID, "template_id": $TEMPLATE_ID, "field_slug": "password",
+ "reference_folder_ids": [$SECURITY_FOLDER_ID]}
 EOF
 
   local grpc_endpoint=""
@@ -201,11 +206,66 @@ EOF
   done
   say "warming up (pulls the sandbox images on first run)"
   openshell_cli sandbox create --name demo-warmup --from "$AGENT_IMAGE" --no-auto-providers --no-keep --no-tty -- true >/dev/null 2>&1 || true
-  printf 'MODE=%s\n' "$([ "$mock" = 1 ] && echo mock || echo platform)" > "$DEMO_HOME/run/demo.env"
+  { printf 'MODE=%s\n' "$([ "$mock" = 1 ] && echo mock || echo platform)"
+    printf 'ORDERS_SECRET_ID=%s\nSECURITY_FOLDER_ID=%s\nMOCK_URL=%s\n' "$ORDERS_SECRET_ID" "$SECURITY_FOLDER_ID" "$MOCK_URL"
+  } > "$DEMO_HOME/run/demo.env"
+  say "security's Orders API key is secret $ORDERS_SECRET_ID; OpenShell may read only from folder $SECURITY_FOLDER_ID"
   say "ready. In each demo terminal: cd $repo && source demo/env.sh"
 }
 
 cmd_api() { exec python3 "$here/orders_api.py" "$API_PORT"; }
+
+load_demo_env() {
+  [ -f "$DEMO_HOME/run/demo.env" ] || die "the demo isn't up; run 'demo/demo.sh up' first"
+  # shellcheck disable=SC1091
+  . "$DEMO_HOME/run/demo.env"
+}
+
+cmd_gateway_db() {
+  # Read-only look at the gateway's own database: which credential handles it
+  # keeps per provider, and whether any API key made it to disk.
+  local db="$DEMO_HOME/xdg-state/openshell/gateway/openshell.db" name hex handles copies
+  [ -f "$db" ] || die "no gateway database yet; run 'demo/demo.sh up' first"
+  printf '\033[2m$ sqlite3 -readonly %s\033[0m\n' "~${db#"$HOME"}"
+  echo "Credentials the OpenShell gateway stores, per provider:"
+  while IFS='|' read -r name hex; do
+    handles="$(printf '%s' "$hex" | xxd -r -p | LC_ALL=C grep -a -Eo 'ref1:[0-9]+/[A-Za-z0-9_.-]+|v1:[0-9]+' | sort -u | paste -s -d ' ' - || true)"
+    printf '  %-12s %s\n' "$name" "${handles:-(none)}"
+  done < <(sqlite3 -readonly "$db" "select name, hex(payload) from objects where object_type = 'provider' order by name")
+  copies="$(cat "$db" "$db-wal" 2>/dev/null | LC_ALL=C grep -a -o -E 'acme_live_|sk-ant-' | wc -l | tr -d ' ' || true)"
+  echo "API keys in the gateway's database files: ${copies:-0}"
+}
+
+mock_call() { curl -fsS -X POST -H 'Content-Type: application/json' -d "$2" "$MOCK_URL$1" >/dev/null; }
+
+cmd_security() {
+  load_demo_env
+  [ "$MODE" = mock ] || die "with a real vault, play the security team in the Secret Server UI (see demo/README.md)"
+  local value
+  case "${1:-}" in
+    rotate)
+      value="${2:-$(python3 -c 'import secrets, string; print("acme_live_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(10)))')}"
+      mock_call "/_test/rotate/$ORDERS_SECRET_ID" "{\"value\": \"$value\"}"
+      say "security rotated the Orders API key (secret $ORDERS_SECRET_ID) in Secret Server" ;;
+    revoke)
+      mock_call "/_test/secret-flags/$ORDERS_SECRET_ID" '{"active": false}'
+      say "security deactivated the Orders API key (secret $ORDERS_SECRET_ID)" ;;
+    restore)
+      mock_call "/_test/secret-flags/$ORDERS_SECRET_ID" '{"active": true}'
+      say "security reactivated the Orders API key (secret $ORDERS_SECRET_ID)" ;;
+    audit)
+      echo "Secret Server audit for secret $ORDERS_SECRET_ID:"
+      curl -fsS "$MOCK_URL/_test/audit" | python3 -c '
+import json, sys, time
+secret_id = int(sys.argv[1])
+for entry in json.load(sys.stdin):
+    if entry["secretId"] == secret_id:
+        when = time.strftime("%H:%M:%S", time.localtime(entry["at"]))
+        print("  %s  %-8s %-14s %s" % (when, entry["action"], entry["user"], entry.get("notes") or ""))
+' "$ORDERS_SECRET_ID" ;;
+    *) die "usage: demo/demo.sh security rotate [new-key] | revoke | restore | audit" ;;
+  esac
+}
 
 cmd_status() {
   openshell_cli status 2>&1 | grep -E "Status|Version" || true
@@ -216,9 +276,15 @@ cmd_down() {
   local purge=0; [ "${1:-}" = "--purge" ] && purge=1
   if [ -x "$DEMO_HOME/bin/openshell" ] && openshell_cli status >/dev/null 2>&1; then
     for s in $(openshell_cli sandbox list 2>/dev/null | awk 'NR>1 {print $1}'); do openshell_cli sandbox delete "$s" >/dev/null 2>&1 || true; done
-    for provider in acme-orders claude; do
-      openshell_cli provider delete "$provider" >/dev/null 2>&1 && say "deleted provider $provider (its secret is deactivated in the vault)" || true
-    done
+    local providers; providers="$(openshell_cli provider list 2>/dev/null | awk 'NR>1 {print $1}' || true)"
+    if grep -qx acme-orders <<<"$providers"; then
+      openshell_cli provider delete acme-orders >/dev/null 2>&1 \
+        && say "deleted provider acme-orders (detached; the security team's secret is unchanged)" || true
+    fi
+    if grep -qx claude <<<"$providers"; then
+      openshell_cli provider delete claude >/dev/null 2>&1 \
+        && say "deleted provider claude (the key it stored is deactivated in the vault)" || true
+    fi
     sleep 2
   fi
   for p in gateway mock; do
@@ -234,7 +300,9 @@ cmd_down() {
 case "${1:-}" in
   up) shift; cmd_up "$@" ;;
   api) cmd_api ;;
+  gateway-db) cmd_gateway_db ;;
+  security) shift; cmd_security "$@" ;;
   status) cmd_status ;;
   down) shift; cmd_down "$@" ;;
-  *) sed -n '5,12p' "$0"; exit 2 ;;
+  *) sed -n '5,14p' "$0"; exit 2 ;;
 esac

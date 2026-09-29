@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: MIT
 """In-process test double for the Delinea Secret Server REST API subset the driver uses.
 
-Implements: POST /oauth2/token, GET /api/v1/secrets/stub, POST /api/v1/secrets,
-GET /api/v1/secrets/{id}, GET|PUT /api/v1/secrets/{id}/fields/{slug},
-DELETE /api/v1/secrets/{id} and GET /api/v1/secrets (search). Endpoints under
-/_test/ exist only for the test harness (rotation, token expiry, audit).
+Implements: POST /oauth2/token, the Platform token endpoint, GET /api/v1/secrets/stub,
+POST /api/v1/secrets, GET /api/v1/secrets/{id}, GET|PUT /api/v1/secrets/{id}/fields/{slug},
+GET /api/v1/secrets/{id}/audits, DELETE /api/v1/secrets/{id}, GET /api/v1/secrets (search),
+folders, templates and sites. Reads honor autoComment/autoCheckout/autoCheckIn, and secrets
+can require a comment or checkout. Endpoints under /_test/ exist only for the test harness.
 """
 
 import json
@@ -18,6 +19,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 # Shaped like the built-in "Password" template: resource, username, password, notes.
 TEMPLATE_ID = 6001
+SECRET_FLAGS = ("requiresComment", "checkOutEnabled", "checkOutChangePasswordEnabled")
 TEMPLATE_FIELDS = [
     {"fieldId": 301, "fieldName": "Resource", "slug": "resource", "isPassword": False},
     {"fieldId": 302, "fieldName": "Username", "slug": "username", "isPassword": False},
@@ -44,19 +46,22 @@ class MockState:
         self.next_id = 1000
         self.audit: List[Dict[str, Any]] = []
 
-    def add_secret(self, name: str, folder_id: int, value: str) -> int:
+    def add_secret(self, name: str, folder_id: int, value: str, extra: Optional[Dict[str, str]] = None) -> int:
+        """Seed a secret the way a person would create it in the UI (no driver involved)."""
+        values = dict(extra or {}, password=value)
         with self.lock:
             secret_id = self.next_id
             self.next_id += 1
-            self.secrets[secret_id] = {
-                "id": secret_id,
-                "name": name,
-                "folderId": folder_id,
-                "secretTemplateId": TEMPLATE_ID,
-                "active": True,
-                "items": [dict(field, itemId=secret_id * 10 + index, itemValue=value if field["slug"] == "password" else "")
-                          for index, field in enumerate(TEMPLATE_FIELDS)],
-            }
+            self.secrets[secret_id] = dict(
+                {flag: False for flag in SECRET_FLAGS},
+                id=secret_id,
+                name=name,
+                folderId=folder_id,
+                secretTemplateId=TEMPLATE_ID,
+                active=True,
+                items=[dict(field, itemId=secret_id * 10 + index, itemValue=values.get(field["slug"], ""))
+                       for index, field in enumerate(TEMPLATE_FIELDS)],
+            )
             return secret_id
 
 
@@ -90,9 +95,34 @@ def make_handler(state: MockState):
                 return None
             return entry[0]
 
-        def _audit(self, user: str, action: str, secret_id: Optional[int]) -> None:
+        def _audit(self, user: str, action: str, secret_id: Optional[int], notes: str = "") -> None:
             with state.lock:
-                state.audit.append({"user": user, "action": action, "secretId": secret_id, "at": time.time()})
+                state.audit.append({"user": user, "action": action, "secretId": secret_id, "notes": notes,
+                                    "at": time.time()})
+
+        def _open(self, user: str, secret: Dict[str, Any], query: Dict[str, str], action: str) -> Optional[Any]:
+            """Apply the secret's access policy to one read; return the model as read, or None if refused."""
+            comment = query.get("autoComment", "")
+            if secret.get("requiresComment") and not comment:
+                _json(self, 400, {"errorCode": "API_CommentRequired", "message": "A comment is required to view this secret"})
+                return None
+            checkout = bool(secret.get("checkOutEnabled"))
+            if checkout and query.get("autoCheckout") != "true":
+                _json(self, 400, {"errorCode": "API_CheckOutRequired", "message": "The secret must be checked out"})
+                return None
+            if checkout:
+                self._audit(user, "CHECKOUT", secret["id"], comment)
+            self._audit(user, action, secret["id"], comment)
+            snapshot = json.loads(json.dumps(secret))
+            if checkout and query.get("autoCheckIn") == "true":
+                self._audit(user, "CHECKIN", secret["id"], comment)
+                if secret.get("checkOutChangePasswordEnabled"):
+                    with state.lock:
+                        for item in secret["items"]:
+                            if item["slug"] == "password":
+                                item["itemValue"] = pysecrets.token_urlsafe(12)
+                    self._audit("RPC", "PASSWORD_CHANGE", secret["id"])
+            return snapshot
 
         def _secret(self, secret_id: int) -> Optional[Dict[str, Any]]:
             secret = state.secrets.get(secret_id)
@@ -183,6 +213,7 @@ def make_handler(state: MockState):
                     state.next_id += 1
                     model["id"] = secret_id
                     model["active"] = True
+                    model.update({flag: False for flag in SECRET_FLAGS})
                     state.secrets[secret_id] = model
                 self._audit(user, "CREATE", secret_id)
                 _json(self, 200, model)
@@ -264,8 +295,19 @@ def make_handler(state: MockState):
                 if not secret:
                     self._not_found()
                     return
-                self._audit(user, "VIEW", secret["id"])
-                _json(self, 200, secret)
+                snapshot = self._open(user, secret, query, "VIEW")
+                if snapshot is not None:
+                    _json(self, 200, snapshot)
+                return
+            if len(parts) == 5 and parts[:3] == ["api", "v1", "secrets"] and parts[4] == "audits":
+                secret_id = int(parts[3]) if parts[3].isdigit() else -1
+                with state.lock:
+                    records = [{"secretAuditId": index + 1, "secretId": entry["secretId"], "action": entry["action"],
+                                "notes": entry.get("notes", ""), "byUserDisplayName": entry["user"],
+                                "dateRecorded": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(entry["at"]))}
+                               for index, entry in enumerate(state.audit) if entry["secretId"] == secret_id]
+                records.reverse()  # newest first, like Secret Server
+                _json(self, 200, {"records": records[:int(query.get("take", 25))], "total": len(records)})
                 return
             if len(parts) == 6 and parts[:3] == ["api", "v1", "secrets"] and parts[4] == "fields":
                 secret = self._secret(int(parts[3]))
@@ -276,8 +318,9 @@ def make_handler(state: MockState):
                 if not item:
                     _json(self, 404, {"message": "field not found"})
                     return
-                self._audit(user, "VIEW_FIELD", secret["id"])
-                _json(self, 200, item.get("itemValue", ""))
+                value = item.get("itemValue", "")
+                if self._open(user, secret, query, "VIEW_FIELD") is not None:
+                    _json(self, 200, value)
                 return
             _json(self, 404, {"message": "route not found"})
 
@@ -286,7 +329,9 @@ def make_handler(state: MockState):
             if not user:
                 self._unauthorized()
                 return
-            parts = [unquote(part) for part in urlparse(self.path).path.strip("/").split("/")]
+            url = urlparse(self.path)
+            query = {key: values[0] for key, values in parse_qs(url.query).items()}
+            parts = [unquote(part) for part in url.path.strip("/").split("/")]
             if len(parts) == 6 and parts[:3] == ["api", "v1", "secrets"] and parts[4] == "fields":
                 secret = self._secret(int(parts[3]))
                 if not secret:
@@ -299,7 +344,7 @@ def make_handler(state: MockState):
                     return
                 with state.lock:
                     item["itemValue"] = body.get("value", "")
-                self._audit(user, "EDIT", secret["id"])
+                self._audit(user, "EDIT", secret["id"], query.get("autoComment", ""))
                 _json(self, 200, item["itemValue"])
                 return
             _json(self, 404, {"message": "route not found"})
@@ -347,7 +392,22 @@ def make_handler(state: MockState):
                     for item in secret["items"]:
                         if item["slug"] == "password":
                             item["itemValue"] = body["value"]
-                    state.audit.append({"user": "RPC", "action": "PASSWORD_CHANGE", "secretId": secret["id"], "at": time.time()})
+                    state.audit.append({"user": "RPC", "action": "PASSWORD_CHANGE", "secretId": secret["id"],
+                                        "notes": "", "at": time.time()})
+                _json(self, 200, {"ok": True})
+            elif path.startswith("/_test/secret-flags/"):
+                secret = state.secrets.get(int(path.rsplit("/", 1)[1]))
+                if not secret:
+                    self._not_found()
+                    return
+                with state.lock:
+                    for key in SECRET_FLAGS + ("active",):
+                        if key in body:
+                            secret[key] = bool(body[key])
+                    if "folderId" in body:
+                        secret["folderId"] = int(body["folderId"])
+                    state.audit.append({"user": "security-admin", "action": "EDIT", "secretId": secret["id"],
+                                        "notes": "", "at": time.time()})
                 _json(self, 200, {"ok": True})
             elif path == "/_test/inactive-readable":
                 state.inactive_readable = bool(body.get("enabled", True))

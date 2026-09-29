@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: MIT
 """Minimal Delinea Secret Server REST client (standard library only).
 
-Covers the calls the credential driver needs: OAuth2 password-grant login,
-secret stub/create/get, field read/update, search and deactivate. Secret
-values and tokens are never logged or included in exception messages.
+Covers the calls the credential driver needs: Platform client-credentials or
+OAuth2 password-grant login, secret stub/create/get, field read/update, search,
+audit and deactivate. Secret values and tokens are never logged or included in
+exception messages.
 """
 
 import json
@@ -166,18 +167,33 @@ class SecretServerClient:
     def create_secret(self, model: Dict[str, Any]) -> Dict[str, Any]:
         return self._call("POST", "/api/v1/secrets", "create secret", body=model)
 
-    def get_secret(self, secret_id: int) -> Dict[str, Any]:
-        return self._call("GET", f"/api/v1/secrets/{secret_id}", "read secret")
+    @staticmethod
+    def _access_params(comment: Optional[str]) -> Optional[Dict[str, str]]:
+        # Secret Server's automatic check-out parameters (11.1 and later): the
+        # comment goes into the secret's audit trail, and checking out and back
+        # in around the read lets secrets that require checkout work.
+        if not comment:
+            return None
+        return {"autoCheckout": "true", "autoCheckIn": "true", "autoComment": comment}
 
-    def get_field(self, secret_id: int, slug: str) -> str:
-        value = self._call("GET", f"/api/v1/secrets/{secret_id}/fields/{quote(slug)}", "read secret field")
+    def get_secret(self, secret_id: int, comment: Optional[str] = None) -> Dict[str, Any]:
+        return self._call("GET", f"/api/v1/secrets/{secret_id}", "read secret", query=self._access_params(comment))
+
+    def get_field(self, secret_id: int, slug: str, comment: Optional[str] = None) -> str:
+        value = self._call("GET", f"/api/v1/secrets/{secret_id}/fields/{quote(slug)}", "read secret field",
+                           query=self._access_params(comment))
         return "" if value is None else str(value)
 
-    def update_field(self, secret_id: int, slug: str, value: str) -> None:
+    def secret_audits(self, secret_id: int, take: int = 25) -> List[Dict[str, Any]]:
+        page = self._call("GET", f"/api/v1/secrets/{secret_id}/audits", "read secret audit", query={"take": take})
+        return page.get("records", []) if isinstance(page, dict) else []
+
+    def update_field(self, secret_id: int, slug: str, value: str, comment: Optional[str] = None) -> None:
         self._call(
             "PUT",
             f"/api/v1/secrets/{secret_id}/fields/{quote(slug)}",
             "update secret field",
+            query=self._access_params(comment),
             body={"value": value},
         )
 
@@ -203,7 +219,6 @@ class SecretServerClient:
             if record.get("name") == name and record.get("active", True)
         ]
 
-
     def discover_site_id(self) -> Optional[int]:
         """Find a usable site: the first active distributed-engine site, else the
         site of any secret this account can see. Returns None if neither works."""
@@ -226,7 +241,28 @@ class SecretServerClient:
             log.info("secret search unavailable for site discovery (%s)", err)
         return None
 
-    # -- setup helpers (used by the live-tenant test) ---------------------
+    # -- setup helpers (used by the live-tenant test and the demo) ----------
+
+    def create_simple_secret(self, name: str, template_id: int, folder_id: int, values: Dict[str, str],
+                             site_id: Optional[int] = None) -> int:
+        """Create a secret from field values keyed by slug, using the minimal body
+        Secret Server accepts. Returns the new secret's ID."""
+        stub = self.get_stub(template_id, folder_id)
+        field_ids = {item.get("slug"): item.get("fieldId") for item in stub.get("items") or []}
+        missing = [slug for slug in values if field_ids.get(slug) is None]
+        if missing:
+            raise SecretServerError(400, f"create secret: template {template_id} has no field {', '.join(missing)}")
+        site = site_id or (int(stub["siteId"]) if int(stub.get("siteId") or 0) > 0 else None) or self.discover_site_id()
+        if not site:
+            raise SecretServerError(400, "create secret: no usable Secret Server site")
+        created = self.create_secret({
+            "name": name,
+            "secretTemplateId": template_id,
+            "folderId": folder_id,
+            "siteId": site,
+            "items": [{"fieldId": field_ids[slug], "itemValue": value} for slug, value in values.items()],
+        })
+        return int(created["id"])
 
     def find_template_id(self, name: str) -> Optional[int]:
         page = self._call("GET", "/api/v1/secret-templates", "search templates",

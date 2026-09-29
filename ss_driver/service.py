@@ -2,14 +2,24 @@
 # SPDX-License-Identifier: MIT
 """OpenShell CredentialDriver gRPC service backed by Delinea Secret Server.
 
-Each gateway-managed provider credential becomes one Secret Server secret in a
-dedicated folder. The handle returned to the gateway is `v1:<secret id>`, and
-every read, update and delete re-checks that the secret behind the handle still
-carries the managed name derived from the identity the gateway presents.
+The driver holds two kinds of provider credentials:
+
+* Stored: a value passed to `openshell provider create` becomes one Secret
+  Server secret in the driver's folder. The handle is `v1:<secret id>`, and
+  every read, update and delete re-checks that the secret behind it still
+  carries the managed name derived from the identity the gateway presents.
+* Attached: a value of `secretserver:<id>[/<field slug>]` points at a secret
+  someone else owns, and nothing is copied. The handle is `ref1:<id>/<slug>`.
+  The secret must sit in a folder listed in reference_folder_ids, the driver
+  never writes to it, and deleting the provider only detaches it.
+
+Every read carries an audit comment naming the provider, credential key and
+workspace, so Secret Server's audit trail shows what each read was for.
 """
 
 import logging
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, Optional, Tuple
 
 import grpc
 
@@ -17,8 +27,8 @@ from . import __version__
 from ._proto import credential_driver_pb2 as pb
 from ._proto import credential_driver_pb2_grpc as pb_grpc
 from ._proto import datamodel_pb2, extension_pb2
-from .config import DriverConfig
-from .naming import managed_secret_name, requested_object_id
+from .config import SLUG_PATTERN, DriverConfig
+from .naming import managed_secret_name, reference_binding, requested_object_id
 from .secret_server import SecretServerClient, SecretServerError
 
 log = logging.getLogger("ss_driver.service")
@@ -29,7 +39,12 @@ CONTRACT_CAPABILITY = "openshell.credentials.contract"
 PROTOCOL_MAJOR = 1
 PROTOCOL_MINOR = 0
 HANDLE_PREFIX = "v1:"
+REFERENCE_HANDLE_PREFIX = "ref1:"
+REFERENCE_PREFIX = "secretserver:"
 OBJECT_ID_METADATA_KEY = "object_id"
+BINDING_METADATA_KEY = "binding"
+_REFERENCE = re.compile(rf"secretserver:([1-9][0-9]{{0,9}})(?:/({SLUG_PATTERN}))?")
+_REFERENCE_HANDLE = re.compile(rf"ref1:([1-9][0-9]{{0,9}})/({SLUG_PATTERN})")
 
 
 def _status_for(err: SecretServerError) -> grpc.StatusCode:
@@ -99,22 +114,37 @@ class CredentialDriverService(pb_grpc.CredentialDriverServicer):
             existing = None
         raw_object_id = existing.metadata.get(OBJECT_ID_METADATA_KEY, "") if existing else request.object_id
         object_id = self._object_id(context, raw_object_id, request.provider_id)
+
+        reference = self._parse_reference(context, request.value)
+        if reference is not None:
+            return self._attach(context, request, existing, object_id, *reference)
+        if existing is not None and existing.handle.startswith(REFERENCE_HANDLE_PREFIX):
+            # The driver never writes into a secret it doesn't own.
+            secret_id, _ = self._reference_handle(context, existing.handle)
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"provider credential '{request.credential_key}' is attached to Secret Server secret {secret_id}, "
+                "which OpenShell doesn't own; change the value in Secret Server, or attach another secret "
+                "with secretserver:<id>",
+            )
+
         name = managed_secret_name(
             request.workspace, request.provider_id, request.provider, request.credential_key, object_id
         )
         slug = self._config.field_slug
+        comment = self._comment("update", request)
         try:
             if existing is not None:
                 secret_id = self._secret_id(context, existing.handle)
-                self._verify_owned(context, self._client.get_secret(secret_id), name, request.credential_key)
-                self._client.update_field(secret_id, slug, request.value)
+                self._verify_owned(context, self._client.get_secret(secret_id, comment), name, request.credential_key)
+                self._client.update_field(secret_id, slug, request.value, comment)
                 action = "updated"
             else:
                 matches = self._client.find_active_by_name(self._config.folder_id, name)
                 if matches:
                     # A retried write after a partial failure reuses the managed secret.
                     secret_id = matches[0]
-                    self._client.update_field(secret_id, slug, request.value)
+                    self._client.update_field(secret_id, slug, request.value, comment)
                     action = "updated"
                 else:
                     secret_id = self._create_secret(context, name, request)
@@ -143,13 +173,11 @@ class CredentialDriverService(pb_grpc.CredentialDriverServicer):
             self._require(context, item.request_id, "request_id")
             if not item.HasField("handle") or not item.handle.handle:
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"credential request '{item.request_id}' is missing handle")
-            object_id = self._object_id(context, item.handle.metadata.get(OBJECT_ID_METADATA_KEY, ""), item.provider_id)
-            name = managed_secret_name(item.workspace, item.provider_id, item.provider, item.credential_key, object_id)
-            secret_id = self._secret_id(context, item.handle.handle)
             try:
-                secret = self._client.get_secret(secret_id)
-                self._verify_owned(context, secret, name, item.credential_key)
-                value = self._extract_value(secret, secret_id)
+                if item.handle.handle.startswith(REFERENCE_HANDLE_PREFIX):
+                    value = self._resolve_attached(context, item)
+                else:
+                    value = self._resolve_stored(context, item)
             except SecretServerError as err:
                 context.abort(_status_for(err), f"Secret Server resolve failed for '{item.request_id}': {err}")
             resolved.append(pb.ResolvedCredential(request_id=item.request_id, value=value))
@@ -159,13 +187,23 @@ class CredentialDriverService(pb_grpc.CredentialDriverServicer):
     def DeleteCredential(self, request, context):
         if not request.HasField("handle") or not request.handle.handle:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "delete request is missing handle")
+        if request.handle.handle.startswith(REFERENCE_HANDLE_PREFIX):
+            # An attached secret belongs to its owner in Secret Server; detaching never touches it.
+            secret_id, _ = self._reference_handle(context, request.handle.handle)
+            log.info(
+                "detached secret %s from provider=%s key=%s; the secret is unchanged",
+                secret_id,
+                request.provider,
+                request.credential_key,
+            )
+            return pb.DeleteCredentialResponse()
         object_id = self._object_id(context, request.handle.metadata.get(OBJECT_ID_METADATA_KEY, ""), request.provider_id)
         name = managed_secret_name(
             request.workspace, request.provider_id, request.provider, request.credential_key, object_id
         )
         secret_id = self._secret_id(context, request.handle.handle)
         try:
-            secret = self._client.get_secret(secret_id)
+            secret = self._client.get_secret(secret_id, self._comment("delete", request))
         except SecretServerError as err:
             if err.status == 404:
                 log.info("secret %s already absent; delete is a no-op", secret_id)
@@ -184,7 +222,102 @@ class CredentialDriverService(pb_grpc.CredentialDriverServicer):
     def ListCredentials(self, request, context):
         context.abort(grpc.StatusCode.UNIMPLEMENTED, "the Secret Server credential driver does not support listing")
 
-    # -- helpers ----------------------------------------------------------
+    # -- attached secrets -----------------------------------------------
+
+    def _attach(self, context, request, existing, object_id: str, secret_id: int, slug: str):
+        if not self._config.reference_folder_ids:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "Secret Server references are disabled; list the folders OpenShell may use in reference_folder_ids",
+            )
+        try:
+            secret = self._client.get_secret(secret_id, self._comment("attach", request))
+            self._check_attachable(context, secret, secret_id, slug)
+            if existing is not None and existing.handle.startswith(HANDLE_PREFIX):
+                # The credential used to hold a value the driver stored; retire that copy.
+                self._retire_stored(context, request, existing, object_id)
+        except SecretServerError as err:
+            context.abort(_status_for(err), f"Secret Server attach failed for '{request.credential_key}': {err}")
+        log.info(
+            "attached secret %s (field %s) to provider=%s key=%s workspace=%s",
+            secret_id,
+            slug,
+            request.provider,
+            request.credential_key,
+            request.workspace or "-",
+        )
+        binding = reference_binding(
+            request.workspace, request.provider_id, request.provider, request.credential_key, object_id, secret_id, slug
+        )
+        return pb.StoreCredentialResponse(
+            handle=datamodel_pb2.CredentialHandle(
+                driver=DRIVER_NAME,
+                handle=f"{REFERENCE_HANDLE_PREFIX}{secret_id}/{slug}",
+                metadata={OBJECT_ID_METADATA_KEY: object_id, BINDING_METADATA_KEY: binding},
+            )
+        )
+
+    def _resolve_attached(self, context, item) -> str:
+        secret_id, slug = self._reference_handle(context, item.handle.handle)
+        object_id = self._object_id(context, item.handle.metadata.get(OBJECT_ID_METADATA_KEY, ""), item.provider_id)
+        expected = reference_binding(
+            item.workspace, item.provider_id, item.provider, item.credential_key, object_id, secret_id, slug
+        )
+        if item.handle.metadata.get(BINDING_METADATA_KEY, "") != expected:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"handle does not belong to provider credential '{item.credential_key}'",
+            )
+        comment = self._comment("resolve", item)
+        secret = self._client.get_secret(secret_id, comment)
+        # Re-checked on every read: deactivating the secret, or moving it out of
+        # an allowed folder, cuts OpenShell off at the next resolve.
+        self._check_attachable(context, secret, secret_id, slug)
+        value = self._extract_value(secret, secret_id, slug, comment)
+        if not value:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, f"field '{slug}' of Secret Server secret {secret_id} is empty")
+        return value
+
+    def _check_attachable(self, context, secret: Dict[str, Any], secret_id: int, slug: str) -> None:
+        folder_id = int(secret.get("folderId", -1))
+        if folder_id == self._config.folder_id or folder_id not in self._config.reference_folder_ids:
+            context.abort(
+                grpc.StatusCode.PERMISSION_DENIED,
+                f"Secret Server secret {secret_id} is not in a folder OpenShell may use (reference_folder_ids)",
+            )
+        if secret.get("active", True) is False:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"Secret Server secret {secret_id} has been deactivated")
+        self._check_checkout_policy(context, secret, secret_id)
+        if not any(item.get("slug") == slug for item in secret.get("items") or []):
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, f"Secret Server secret {secret_id} has no field '{slug}'")
+
+    def _retire_stored(self, context, request, existing, object_id: str) -> None:
+        name = managed_secret_name(
+            request.workspace, request.provider_id, request.provider, request.credential_key, object_id
+        )
+        old_id = self._secret_id(context, existing.handle)
+        try:
+            secret = self._client.get_secret(old_id, self._comment("retire", request))
+        except SecretServerError as err:
+            if err.status == 404:
+                return
+            raise
+        if self._verify_owned(context, secret, name, request.credential_key, allow_inactive=True):
+            self._client.deactivate_secret(old_id)
+            log.info("deactivated secret %s; provider=%s key=%s now uses an attached secret",
+                     old_id, request.provider, request.credential_key)
+
+    # -- stored secrets -----------------------------------------------------
+
+    def _resolve_stored(self, context, item) -> str:
+        object_id = self._object_id(context, item.handle.metadata.get(OBJECT_ID_METADATA_KEY, ""), item.provider_id)
+        name = managed_secret_name(item.workspace, item.provider_id, item.provider, item.credential_key, object_id)
+        secret_id = self._secret_id(context, item.handle.handle)
+        comment = self._comment("resolve", item)
+        secret = self._client.get_secret(secret_id, comment)
+        self._verify_owned(context, secret, name, item.credential_key)
+        self._check_checkout_policy(context, secret, secret_id)
+        return self._extract_value(secret, secret_id, self._config.field_slug, comment)
 
     def _create_secret(self, context, name: str, request) -> int:
         # The stub is used only to learn the template's field IDs. The create body
@@ -240,16 +373,6 @@ class CredentialDriverService(pb_grpc.CredentialDriverServicer):
         log.info("using Secret Server site %s (%s)", self._site_id, source)
         return self._site_id
 
-    def _extract_value(self, secret: Dict[str, Any], secret_id: int) -> str:
-        for item in secret.get("items") or []:
-            if item.get("slug") == self._config.field_slug:
-                value: Optional[str] = item.get("itemValue")
-                if value is not None:
-                    return value
-                break
-        # Some deployments omit protected values from the secret model.
-        return self._client.get_field(secret_id, self._config.field_slug)
-
     def _verify_owned(
         self,
         context,
@@ -275,6 +398,58 @@ class CredentialDriverService(pb_grpc.CredentialDriverServicer):
                 f"the Secret Server secret for provider credential '{credential_key}' has been deactivated",
             )
         return active
+
+    # -- helpers ----------------------------------------------------------
+
+    def _extract_value(self, secret: Dict[str, Any], secret_id: int, slug: str, comment: Optional[str]) -> str:
+        for item in secret.get("items") or []:
+            if item.get("slug") == slug:
+                value: Optional[str] = item.get("itemValue")
+                if value:
+                    return value
+                break
+        # Some deployments omit protected values from the secret model.
+        return self._client.get_field(secret_id, slug, comment)
+
+    def _comment(self, operation: str, request) -> Optional[str]:
+        """The audit comment Secret Server records with a read. Never includes a value."""
+        if not self._config.audit_comments:
+            return None
+        text = (
+            f"OpenShell {operation}: provider={request.provider} key={request.credential_key} "
+            f"workspace={request.workspace or '-'}"
+        )
+        return "".join(ch for ch in text if ch.isprintable())[:250]
+
+    @staticmethod
+    def _check_checkout_policy(context, secret: Dict[str, Any], secret_id: int) -> None:
+        # OpenShell keeps a resolved value for the sandbox's lifetime, so a secret
+        # that changes its password on check-in would stop working right away.
+        if secret.get("checkOutEnabled") and secret.get("checkOutChangePasswordEnabled"):
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"Secret Server secret {secret_id} changes its password on check-in, so the value OpenShell "
+                "holds would stop working; turn that off or use another secret",
+            )
+
+    def _parse_reference(self, context, value: str) -> Optional[Tuple[int, str]]:
+        text = value.strip()
+        if not text.startswith(REFERENCE_PREFIX):
+            return None
+        match = _REFERENCE.fullmatch(text)
+        if not match:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "a Secret Server reference looks like secretserver:<secret id> or secretserver:<secret id>/<field slug>",
+            )
+        return int(match.group(1)), match.group(2) or self._config.field_slug
+
+    @staticmethod
+    def _reference_handle(context, handle: str) -> Tuple[int, str]:
+        match = _REFERENCE_HANDLE.fullmatch(handle)
+        if not match:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Secret Server credential handle is malformed")
+        return int(match.group(1)), match.group(2)
 
     @staticmethod
     def _secret_id(context, handle: str) -> int:
