@@ -1,0 +1,10 @@
+{
+  "base_url": "https://secretserver.example.com/SecretServer",
+  "folder_id": 42,
+  "template_id": 6001,
+  "field_slug": "password",
+  "username": "svc-openshell-driver",
+  "password_file": "/etc/openshell/delinea-secret-server.password",
+  "ca_bundle": "/etc/openshell/delinea-secret-server-ca.pem",
+  "timeout_secs": 15
+}

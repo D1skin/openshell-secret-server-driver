@@ -1,0 +1,12 @@
+.venv/
+generated/
+__pycache__/
+*.pyc
+run/
+*.log
+.live-test-leftovers.json
+# never commit credentials or environment files
+.env
+.env.*
+*.creds
+.creds
