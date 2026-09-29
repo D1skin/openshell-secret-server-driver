@@ -62,7 +62,7 @@ flowchart LR
 | `StoreCredential` | Creates one secret per credential in a dedicated folder, or updates it in place. |
 | `ResolveCredentials` | Reads the secret, verifies it's the managed one for that exact provider and key, returns the value. |
 | `DeleteCredential` | Deactivates the secret (soft delete, stays in the audit trail). |
-| `ListCredentials` | Not implemented yet. |
+| `ListCredentials` | Returns `UNIMPLEMENTED`. It's optional, and the OpenShell gateway doesn't call it (v0.1.2). |
 
 ## ✨ Features
 
@@ -158,23 +158,12 @@ Results are reported as passed, failed and not run, never "green" by omission.
 - Resolved values do still pass through the gateway and the sandbox supervisor's memory; that's
   OpenShell's design. Secret Server holds them at rest and audits every read.
 
-## 🧭 Lessons from a real Platform tenant
-
-- The vault behind a Platform tenant is listed at `/vaultbroker/api/vaults` and accepts the
-  service account's Platform token.
-- Secret creation wants a minimal body (`name`, template, folder, site, `{fieldId, itemValue}`
-  items). Echoing the full stub back gets "The request is invalid."
-- `siteId` is required (1 or higher) even though stubs return `0`.
-- A missing secret answers `400 API_AccessDenied`, not `404`.
-- Deactivated secrets stay readable with `active: false`.
-- A resolve costs about 380 ms against Secret Server Cloud.
-
 ## 🗺️ Roadmap
 
 - [x] Wet test under a live OpenShell gateway and sandbox
 - [ ] Scripted wet test, including a Delinea Platform backend
 - [ ] Parallel batch resolves
-- [ ] `ListCredentials`
+- [ ] `ListCredentials`, once OpenShell uses it
 - [ ] Go or Rust port for production footprint
 - [ ] Propose upstream to NVIDIA/OpenShell
 
