@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
+# Acme's production Orders API key. OpenShell sends it only as a bearer token, only on
+# read-only requests, only from curl, and only to the Orders API. Everywhere else the
+# agent has a placeholder.
+id: acme-orders
+display_name: Acme Orders API
+description: Read-only access to Acme's Orders API for the refund agent
+category: other
+credentials:
+  - name: api_key
+    description: Orders API key, stored in Delinea Secret Server
+    env_vars: [ORDERS_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: host.openshell.internal
+    port: 18099
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries: [/usr/bin/curl]

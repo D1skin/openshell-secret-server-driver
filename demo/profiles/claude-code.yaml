@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 Gal Diskin
+# SPDX-License-Identifier: MIT
+# Claude Code's own Anthropic API key, also stored in Delinea Secret Server. Based on
+# OpenShell's example claude-code profile, trimmed to the inference endpoint and pinned
+# to the real path of the native claude binary in demo/agent-image.
+id: claude-code
+display_name: Claude Code
+description: Claude Code CLI (demo image)
+category: agent
+inference_capable: true
+credentials:
+  - name: api_key
+    description: Anthropic API key used by Claude Code
+    env_vars: [ANTHROPIC_API_KEY]
+    required: true
+    auth_style: header
+    header_name: x-api-key
+endpoints:
+  - host: api.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe]

@@ -128,6 +128,12 @@ Then configure the driver (`examples/driver-config.json`) and prepare Secret Ser
 2. Pick a template with a password-type field (slug `password` by default).
 3. Keep checkout, approval and comment requirements off that folder, since the gateway resolves unattended.
 
+## 🎬 Demo
+
+[`demo/`](demo/) replays a real user story end to end: Claude Code triages refunds inside an
+OpenShell sandbox using an Orders API key that lives in Secret Server. It covers rotation, audit,
+a prompt-injected agent with nothing to steal, and a kill switch.
+
 ## ⚙️ Configuration
 
 Every setting can come from the JSON config or an environment variable.
